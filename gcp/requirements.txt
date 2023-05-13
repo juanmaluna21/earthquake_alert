@@ -1,0 +1,6 @@
+# Function dependencies, for example:
+# package>=version
+pymongo>=4.3.3
+requests>=2.28.1
+pandas
+numpy
