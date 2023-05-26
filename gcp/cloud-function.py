@@ -4,12 +4,17 @@ from urllib.request import urlopen
 import json as json
 import numpy as np
 import pandas as pd
+import asyncio
+from telegram import Bot
+from sklearn.cluster import KMeans
+import re
+import emoji
 
 def connect_to_mongodb():
     # Conexión a MongoDB Atlas
-    client = pymongo.MongoClient("mongodb+srv://vansik:Dcshooes_4@cluster1.e3cwjp7.mongodb.net/Alert_Sismic_Last?retryWrites=true&w=majority&serverSelectionTimeoutMS=50000")
-    db = client["Alert_Sismic_Last"]
-    collection = db["Last"]
+    client = pymongo.MongoClient("mongodb+srv://vansik:Dcshooes_4@cluster1.e3cwjp7.mongodb.net/Api_whatsaap?retryWrites=true&w=majority&serverSelectionTimeoutMS=50000")
+    db = client["Api_whatsaap"]
+    collection = db["Api"]
 
     return collection
 
@@ -33,21 +38,15 @@ def transformacion_usa(df):
 def transformacion_japon(df):
     #eliminamos las columnas que no vamos a utilizar
     df= df.drop(columns=['ctt','eid','rdt','ttl','ift','ser','anm','acd','maxi','int','json','en_ttl'])
-    #eliminamos y/o reemplazamos caracateres innecesarios
-    df['cod'] = df['cod'].str.replace('+', '', regex=False) # Esta linea de codigo reemplaza exclusivamente el primer '+'
-    df['cod'] = df['cod'].str.replace('+', ',')
-    df['cod'] = df['cod'].str.replace('-', ',')
-    df['cod'] = df['cod'].str.replace('/', '')
-
-    #ahora que esta limpio podemos separar los datos
-    df = df.join(df['cod'].str.split(',', expand=True).rename(columns={0:'latitude', 1:'longitude', 2:'depth'}))
+    # Extraemos la información de la columna 'cod'
+    df[['latitude', 'longitude', 'depth']] = df['cod'].str.extract(r'(\+[\d\.]+)\+(\d+\.\d+)\-(\d+)').astype(float)
     df = df.drop(columns='cod')
 
     #convertimos a float la columna "depth"
     df['depth'] = df['depth'].astype('float64')
     #dividimos por mil para llevar la unidad de medida a KM para mantener la misma en todos los datasets
     df['depth'] = (df['depth'] / 1000)
-
+    df['mag'] = df['mag'].replace({'': np.nan}).astype('float64')
     #renombramos columnas
     df = df.rename(columns={'at': 'time', 'en_anm': 'place'})
     #reordenamos columnas
@@ -58,13 +57,13 @@ def transformacion_japon(df):
     df=df.applymap(lambda x: x.lower() if isinstance(x,str) else x)
     #agrego una columna "country" con el nombre del pais respectivo en caso que necesite identificar en procesos posteriores
     df['country']='japon'
-
+    
     #Vamos a redondear las columnas de variables float
     df[['latitude','longitude','depth','mag']]=df[['latitude','longitude','depth','mag']].round(1)
 
     #reemplazamos los "ｍ不明" ("desconocido en español") de la columna "mag" por NaN
     df['mag'] = df['mag'].replace({'ｍ不明': np.nan, '': np.nan})
-
+    
     #eliminamos duplicados
     df= df.drop_duplicates()
     
@@ -114,10 +113,87 @@ def transformacion_chile(df):
     df=df.head(1)
     return df
 
+def etiquetado(df):
+    #separamos los campos que quiero para ejecutar el modelo
+    df = df.dropna()
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    X= df[['depth','mag']]
+    #seleccionamos el modelo
+    kmeans= KMeans(n_clusters=4, random_state=0)
+    #entrenamos el modelo
+    kmeans.fit(X)
+    #traigo las etiquetas
+    etiquetas= kmeans.labels_
+    #Agregamos las etiquetas al dataset
+    df['etiquetas']= etiquetas
+    # Reemplazamos los valores de las etiquetas por 'leve', 'medio' y 'alto'
+    df['etiquetas'].replace({2: 'leve', 3: 'medio', 1: 'alto'}, inplace=True)
+    df=df.reset_index()
+    df=df.head(3)
+    # Reemplazamos los valores de las etiquetas específicos dentro del DataFrame
+    df.loc[df['etiquetas'] == 'leve', 'etiquetas'] = 'leve'
+    df.loc[df['etiquetas'] == 'medio', 'etiquetas'] = 'medio'
+    df.loc[df['etiquetas'] == 'alto', 'etiquetas'] = 'alto'
+    return df
+
+async def send_telegram_notification(record):
+    # Configurar el token del bot de Telegram
+    telegram_token = '6086740780:AAHcLxljbhtvMfkO_Srad1-EQdVmViigzN4' 
+    mapbox_token = 'pk.eyJ1IjoidmFuc2lrIiwiYSI6ImNsaG9tbmJiODBhMmQzZmxwdnd3eTVtdHYifQ.RnG-yRvarNlfb3WxneET_Q'
+    map_style = 'vansik/clhp2wbfu01da01peackketh1'
+
+
+    # Crear una instancia del bot de Telegram
+    bot = Bot(token=telegram_token)
+
+    etiqueta = record['etiquetas']
+    if etiqueta == 0:
+        return
+    if etiqueta == 'leve':
+        mensaje = "¡Sismo leve! 🚨\nRevisar las conexiones de luz, gas y agua. 💡🔥💧"
+    elif etiqueta == 'alto':
+        mensaje = "¡Sismo fuerte! 🔥🚨\nSi es posible, evacuar. De lo contrario, buscar resguardo en un sitio seguro. 🏃‍♂️🏃‍♀️🚪"
+    elif etiqueta == 'medio':
+        mensaje = "¡Sismo medio! 🌎🚨\nResguardate bajo una mesa o la cama. 🛌👍"
+    else: 
+        pass
+        
+    # Extraer detalles del terremoto
+    country = record['country']
+    magnitude = record['mag']
+    latitude = record['latitude']
+    longitude = record['longitude']
+    depthh = record['depth']
+    etiquetass = record['etiquetas']
+
+    if country == 'usa':
+        emoji_country = "🇺🇸"
+    elif country == 'chile':
+        emoji_country = "🇨🇱"
+    elif country == 'japon':
+        emoji_country = "🇯🇵"
+    else:
+        emoji_country = ""
+    
+    # Otros detalles del terremoto según la estructura del DataFrame
+    #map_url = f'https://api.mapbox.com/styles/v1/{map_style}/static/pin-s+ff0000({longitude},{latitude})/{longitude},{latitude},5/600x400?access_token={mapbox_token}'
+    map_url2 = f'https://sismic-alert.streamlit.app/?val={country}&val={latitude}&val={longitude}&val={depthh}&val={magnitude}&val={etiquetass}'
+    # Crear la palabra clave enlazada a la URL completa
+    url_keyword = f'<a href="{map_url2}">Ver mapa y otros detalles</a>'
+    # Crear el mensaje
+    message_text = f"¡Se ha detectado un sismo en {country} {emoji_country}!\n" \
+                   f"Nivel: {mensaje} \n" \
+                   f"{url_keyword} \n"
+
+    # Enviar el mensaje al grupo de Telegram
+    await bot.send_message(chat_id='-904835114', text=message_text, parse_mode="html")
+
+    print('Notificación de Telegram enviada')    
+
 
 def main(request):
     #importamos la informacion a traves de la API
-    url = "https://earthquake.usgs.gov/fdsnws/event/1/query?format=csv&orderby=time&limit=1"
+    url = "https://earthquake.usgs.gov/fdsnws/event/1/query?format=csv&orderby=time"
     df_usa= pd.read_csv(url)
     pd.set_option('display.max_columns', None)
 
@@ -140,7 +216,10 @@ def main(request):
     df_chile= transformacion_chile(df_chile)
     
     # Concatenar los DataFrames
-    combined_df = pd.concat([df_usa, df_japon, df_chile], ignore_index=True)
+    combined_df = pd.concat([df_japon, df_chile,df_usa], ignore_index=True)
+
+    # Aplico el modelo de Machine Learning
+    combined_df=etiquetado(combined_df)
 
     # Conexión a MongoDB Atlas
     collection = connect_to_mongodb()
@@ -152,5 +231,8 @@ def main(request):
         if existing_record is None:
             # Insertar el registro en la colección de MongoDB
             collection.insert_one(record)
+
+            # Enviar mensaje de telegram
+            asyncio.run(send_telegram_notification(record))
 
     return "ETL process completed successfully"

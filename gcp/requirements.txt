@@ -4,3 +4,6 @@ pymongo>=4.3.3
 requests>=2.28.1
 pandas
 numpy
+python-telegram-bot
+scikit-learn
+emoji
